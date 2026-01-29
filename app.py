@@ -13,13 +13,18 @@ st.title("🦅 股市全域戰情 (Ultimate Ver.)")
 with st.sidebar:
     st.header("⚙️ 參數設定")
     
-    # 嘗試從 secrets 讀取，如果沒有就留空
+    # --- 智慧鑰匙判斷邏輯 (修改這段) ---
     if 'fugle_api_key' in st.secrets:
-        default_key = st.secrets['fugle_api_key']
+        # 如果雲端後台有設定，直接讀取，不顯示輸入框
+        api_key = st.secrets['fugle_api_key']
+        st.success("✅ API Key 已從雲端載入") 
     else:
-        default_key = ""
-        
-    api_key = st.text_input("Fugle API Key", value=default_key, type="password")
+        # 如果後台沒設定 (例如在本機跑且沒 secrets.toml)，才顯示輸入框
+        api_key = st.text_input("Fugle API Key", type="password")
+    # ----------------------------------
+
+    symbol = st.text_input("股票代號", value="3231")
+    # ... (後面不變)
     symbol = st.text_input("股票代號", value="3231")
     timeframe = st.selectbox("K線週期", ["1T", "5T", "30T", "60T"], index=1)
     
@@ -142,4 +147,5 @@ if st.button("🚀 啟動全域掃描"):
                 
         except Exception as e:
             st.error(f"發生錯誤: {e}")
+
 
