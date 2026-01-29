@@ -38,7 +38,18 @@ def get_signal(row):
     if row['RSI'] > 80: signal.append("🔴RSI過熱")
     if row['k'] < 20 and row['k'] > row['d']: signal.append("⚡KD金叉(低檔)")
     return " ".join(signal) if signal else "觀察中"
-
+    
+# --- 新增這個函數用來抓中文名稱 ---
+@st.cache_data(ttl=86400)  # 🌟 重點：快取存 24 小時，超級省錢！
+def get_stock_name(symbol, api_key):
+    try:
+        client = RestClient(api_key=api_key)
+        # 呼叫 quote API 取得簡介，只為了拿 name
+        quote = client.stock.intraday.quote(symbol=symbol)
+        return quote.get('name', symbol)  # 如果抓不到就回傳代號
+    except Exception:
+        return symbol
+        
 def process_data(symbol, api_key, timeframe):
     client = RestClient(api_key=api_key)
     stock = client.stock
@@ -99,6 +110,13 @@ if st.button("🚀 啟動全域掃描"):
         st.error("請輸入 API Key")
     else:
         try:
+            # 1. 先抓名字 (這會用快取，不扣次數)
+            stock_name = get_stock_name(symbol, api_key)
+            
+            # 2. 再顯示大標題
+            st.subheader(f"📊 {stock_name} ({symbol}) - {timeframe}")
+
+            # 3. 接著才是原本的運算 (這會用 60秒快取)
             df, error = process_data(symbol, api_key, timeframe)
             if error:
                 st.error(error)
@@ -127,7 +145,7 @@ if st.button("🚀 啟動全域掃描"):
                 technical_data = output_df.to_dict(orient='index')
 
                 payload = {
-                    "stock": symbol,
+                    "stock": f"{stock_name} ({symbol})",
                     "timeframe": timeframe,
                     "indicators": {
                         "MA": f"MA{ma_short} vs MA{ma_long}",
@@ -150,6 +168,7 @@ if st.button("🚀 啟動全域掃描"):
                 
         except Exception as e:
             st.error(f"發生錯誤: {e}")
+
 
 
 
