@@ -1,0 +1,4 @@
+streamlit
+fugle-marketdata
+pandas_ta
+pandas
