@@ -1,116 +1,138 @@
 import streamlit as st
 from fugle_marketdata import RestClient
 import pandas as pd
-import pandas_ta as ta  # 技術指標計算神器
+import pandas_ta as ta
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- 設定頁面 ---
-st.set_page_config(page_title="AI 股市戰情室 Pro", page_icon="🦅", layout="wide")
-st.title("🦅 股市全域戰情 (Data to Gemini)")
+st.set_page_config(page_title="AI 股市指揮所 (Ultimate)", page_icon="🦅", layout="wide")
+st.title("🦅 股市全域戰情 (Ultimate Ver.)")
 
-# --- 側邊欄設定 ---
+# --- 側邊欄 ---
 with st.sidebar:
-    st.header("⚙️ 設定參數")
+    st.header("⚙️ 參數設定")
+    # 建議把 Key 寫死在 code 裡或用 secrets，方便手機操作
     api_key = st.text_input("Fugle API Key", type="password")
-    symbol = st.text_input("股票代號", value="2383")
-    timeframe = st.selectbox("K線週期", ["1T", "5T", "30T", "60T"], index=2, help="T代表分鐘")
+    symbol = st.text_input("股票代號", value="3231")
+    timeframe = st.selectbox("K線週期", ["1T", "5T", "30T", "60T"], index=1)
     
-    st.markdown("---")
     st.markdown("### 📊 指標參數")
     ma_short = st.number_input("短均線 (MA)", value=5)
-    ma_long = st.number_input("長均線 (MA)", value=20)
-    rsi_len = st.number_input("RSI 週期", value=6)
+    # 這裡如果不夠長，計算會回傳 null，但不影響程式運行
+    ma_long = st.number_input("長均線 (MA)", value=20) 
 
-# --- 核心函數：處理 K 棒與指標 ---
-def process_candles(symbol, api_key, timeframe):
+def get_signal(row):
+    # 簡單的訊號判讀，顯示在畫面上給人看
+    signal = []
+    if row['RSI'] < 20: signal.append("🟢RSI超賣")
+    if row['RSI'] > 80: signal.append("🔴RSI過熱")
+    if row['k'] < 20 and row['k'] > row['d']: signal.append("⚡KD金叉(低檔)")
+    return " ".join(signal) if signal else "觀察中"
+
+def process_data(symbol, api_key, timeframe):
     client = RestClient(api_key=api_key)
     stock = client.stock
     
-    # 1. 抓取最近的 K 棒 (Intraday Candles)
-    # Fugle 回傳的是 1 分鐘 K 棒，我們抓多一點來重取樣
+    # 抓取 Intraday Candles
     candles = stock.intraday.candles(symbol=symbol)
-    
     if 'data' not in candles or not candles['data']:
-        return None, "抓不到 K 棒資料"
+        return None, "抓不到資料，請確認開盤中或 Key 正確"
 
-    # 2. 轉成 DataFrame
     df = pd.DataFrame(candles['data'])
     df['date'] = pd.to_datetime(df['date'])
     df = df.set_index('date')
-    
-    # 欄位重新命名以符合 pandas_ta 習慣
     df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
     df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
 
-    # 3. 重取樣 (Resample) - 把 1 分K 合成為 30分K / 60分K
-    # 邏輯：開盤價取第一筆，收盤價取最後一筆，高點取最大，低點取最小，成交量加總
-    ohlc_dict = {
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }
-    df_resampled = df.resample(timeframe).apply(ohlc_dict).dropna()
+    # 重取樣 (Resample)
+    ohlc_dict = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
+    df_res = df.resample(timeframe).apply(ohlc_dict).dropna()
 
-    # 4. 計算技術指標 (使用 pandas_ta)
-    # MA (移動平均)
-    df_resampled[f'MA{ma_short}'] = ta.sma(df_resampled['Close'], length=ma_short)
-    df_resampled[f'MA{ma_long}'] = ta.sma(df_resampled['Close'], length=ma_long)
-    
-    # RSI (相對強弱)
-    df_resampled[f'RSI{rsi_len}'] = ta.rsi(df_resampled['Close'], length=rsi_len)
-    
-    # MACD
-    macd = ta.macd(df_resampled['Close'])
-    # 將 MACD 欄位合併進來 (MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9)
-    df_resampled = pd.concat([df_resampled, macd], axis=1)
+    # --- 1. 計算均線 ---
+    df_res[f'MA{ma_short}'] = ta.sma(df_res['Close'], length=ma_short)
+    df_res[f'MA{ma_long}'] = ta.sma(df_res['Close'], length=ma_long)
 
-    return df_resampled, None
+    # --- 2. 計算 RSI ---
+    df_res['RSI'] = ta.rsi(df_res['Close'], length=6)
 
-# --- 主程式 ---
+    # --- 3. 計算 MACD ---
+    macd = ta.macd(df_res['Close'], fast=12, slow=26, signal=9)
+    if macd is not None:
+        df_res = pd.concat([df_res, macd], axis=1)
+
+    # --- 4. 計算 KD (Stochastic) --- 🌟 新增
+    # k=9, d=3, smooth_d=3
+    stoch = ta.stoch(df_res['High'], df_res['Low'], df_res['Close'], k=9, d=3, smooth_k=3)
+    if stoch is not None:
+        df_res = pd.concat([df_res, stoch], axis=1)
+        # pandas_ta 欄位名稱通常是 STOCHk_9_3_3, STOCHd_9_3_3，我們簡化它
+        df_res['k'] = df_res['STOCHk_9_3_3']
+        df_res['d'] = df_res['STOCHd_9_3_3']
+
+    # --- 5. 計算布林通道 (Bollinger Bands) --- 🌟 新增
+    bbands = ta.bbands(df_res['Close'], length=20, std=2)
+    if bbands is not None:
+        df_res = pd.concat([df_res, bbands], axis=1)
+        # 簡化欄位：Upper, Lower, Middle
+        df_res['BB_Upper'] = df_res['BBU_20_2.0']
+        df_res['BB_Lower'] = df_res['BBL_20_2.0']
+
+    return df_res, None
+
 if st.button("🚀 啟動全域掃描"):
     if not api_key:
         st.error("請輸入 API Key")
     else:
         try:
-            # 1. 執行運算
-            df, error = process_candles(symbol, api_key, timeframe)
-            
+            df, error = process_data(symbol, api_key, timeframe)
             if error:
                 st.error(error)
             else:
-                # 2. 取得現價 (用於確認)
-                current_price = df['Close'].iloc[-1]
-                st.metric(f"{symbol} 目前 ({timeframe}) 收盤價", current_price)
-
-                # 3. 整理 JSON 給 Gemini
-                # 我們只取「最後 5 根」K棒給 Gemini 就好，不然資料太多
-                last_n = 5
-                output_df = df.tail(last_n).copy()
+                # 取得最新一筆資料
+                latest = df.iloc[-1]
                 
-                # 格式化時間變成字串
-                output_df.index = output_df.index.strftime('%Y-%m-%d %H:%M:%S')
+                # 畫面顯示即時重點
+                col1, col2, col3 = st.columns(3)
+                col1.metric("現價", f"{latest['Close']}", f"{latest['Volume']:.0f} 張")
+                col2.metric("RSI (6)", f"{latest['RSI']:.2f}")
                 
-                # 轉成 Dict
-                k_data = output_df.to_dict(orient='index')
+                # 處理 KD 顯示 (如果資料不足會是 NaN)
+                k_val = f"{latest.get('k', 0):.2f}" if pd.notna(latest.get('k')) else "N/A"
+                col3.metric("KD (K值)", k_val)
 
-                gemini_payload = {
+                st.info(f"AI 訊號掃描: {get_signal(latest)}")
+
+                # 準備 JSON
+                output_df = df.tail(5).copy()
+                output_df.index = output_df.index.strftime('%H:%M')
+                
+                # 清理 NaN (JSON 不支援 NaN)
+                output_df = output_df.fillna("資料不足")
+                
+                technical_data = output_df.to_dict(orient='index')
+
+                payload = {
                     "stock": symbol,
                     "timeframe": timeframe,
-                    "analysis_needed": "請根據 MA 排列、RSI 背離與 MACD 柱狀圖分析趨勢",
-                    "technical_data": k_data
+                    "indicators": {
+                        "MA": f"MA{ma_short} vs MA{ma_long}",
+                        "RSI": "RSI(6)",
+                        "MACD": "12,26,9",
+                        "KD": "9,3,3 (Slow)",
+                        "Bollinger": "20, 2"
+                    },
+                    "data": technical_data
                 }
-
-                json_str = json.dumps(gemini_payload, indent=2, ensure_ascii=False)
-
-                # 4. 顯示結果
-                st.subheader("📋 複製這串 JSON 給教練")
+                
+                json_str = json.dumps(payload, indent=2, ensure_ascii=False)
+                
+                st.subheader("📋 複製這串給 Gemini")
                 st.code(json_str, language='json')
                 
-                # 畫個簡單的圖自己看爽的
-                st.line_chart(df[['Close', f'MA{ma_short}', f'MA{ma_long}']].tail(50))
-
+                # 簡單畫圖：K值與 D值
+                if 'k' in df.columns:
+                    st.line_chart(df[['k', 'd']].tail(50))
+                
         except Exception as e:
-            st.error(f"系統錯誤: {e}")
+            st.error(f"發生錯誤: {e}")
