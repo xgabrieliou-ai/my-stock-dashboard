@@ -24,8 +24,6 @@ with st.sidebar:
     # ----------------------------------
 
     symbol = st.text_input("股票代號", value="3231")
-    # ... (後面不變)
-    symbol = st.text_input("股票代號", value="3231")
     timeframe = st.selectbox("K線週期", ["1T", "5T", "30T", "60T"], index=1)
     
     st.markdown("### 📊 指標參數")
@@ -147,5 +145,6 @@ if st.button("🚀 啟動全域掃描"):
                 
         except Exception as e:
             st.error(f"發生錯誤: {e}")
+
 
 
