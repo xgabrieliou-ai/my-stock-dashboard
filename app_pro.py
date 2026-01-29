@@ -12,8 +12,14 @@ st.title("🦅 股市全域戰情 (Ultimate Ver.)")
 # --- 側邊欄 ---
 with st.sidebar:
     st.header("⚙️ 參數設定")
-    # 建議把 Key 寫死在 code 裡或用 secrets，方便手機操作
-    api_key = st.text_input("Fugle API Key", type="password")
+    
+    # 嘗試從 secrets 讀取，如果沒有就留空
+    if 'fugle_api_key' in st.secrets:
+        default_key = st.secrets['fugle_api_key']
+    else:
+        default_key = ""
+        
+    api_key = st.text_input("Fugle API Key", value=default_key, type="password")
     symbol = st.text_input("股票代號", value="3231")
     timeframe = st.selectbox("K線週期", ["1T", "5T", "30T", "60T"], index=1)
     
@@ -136,3 +142,4 @@ if st.button("🚀 啟動全域掃描"):
                 
         except Exception as e:
             st.error(f"發生錯誤: {e}")
+
