@@ -79,13 +79,18 @@ def process_data(symbol, api_key, timeframe):
         df_res['k'] = df_res['STOCHk_9_3_3']
         df_res['d'] = df_res['STOCHd_9_3_3']
 
-    # --- 5. 計算布林通道 (Bollinger Bands) --- 🌟 新增
+# --- 5. 計算布林通道 (Bollinger Bands) --- 🌟 修正版
     bbands = ta.bbands(df_res['Close'], length=20, std=2)
     if bbands is not None:
         df_res = pd.concat([df_res, bbands], axis=1)
-        # 簡化欄位：Upper, Lower, Middle
-        df_res['BB_Upper'] = df_res['BBU_20_2.0']
-        df_res['BB_Lower'] = df_res['BBL_20_2.0']
+        
+        # 🌟 修正重點：自動抓取欄位名稱 (不用猜是 2.0 還是 2)
+        # 直接從產生的欄位裡，找出 BBU (上軌) 和 BBL (下軌) 開頭的
+        for col in bbands.columns:
+            if col.startswith("BBU"):  # 抓上軌
+                df_res['BB_Upper'] = df_res[col]
+            elif col.startswith("BBL"): # 抓下軌
+                df_res['BB_Lower'] = df_res[col]
 
     return df_res, None
 
@@ -145,6 +150,7 @@ if st.button("🚀 啟動全域掃描"):
                 
         except Exception as e:
             st.error(f"發生錯誤: {e}")
+
 
 
 
