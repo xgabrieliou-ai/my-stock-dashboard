@@ -1,24 +1,21 @@
 import streamlit as st
 import pandas as pd
-import numpy as np # 用來做基礎運算
+import numpy as np
 from fugle_marketdata import RestClient
 import google.generativeai as genai
 import plotly.graph_objects as go
 import json
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="AI 股市戰情室 (Fugle 輕量版)", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="AI 股市戰情室 (Gemini 3 Flash)", layout="wide", page_icon="⚡")
 
-# --- 0. 核心：手寫技術指標 (不依賴 pandas_ta，避免報錯) ---
+# --- 0. 核心：手寫技術指標 (極速運算) ---
 def calculate_indicators_manual(df):
-    """
-    使用純 Pandas 計算指標，避開 Numba/Pandas_TA 的相容性地獄
-    """
-    # 1. MA (移動平均)
+    # MA
     df['MA5'] = df['Close'].rolling(window=5).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
 
-    # 2. RSI (相對強弱 - 參數 6)
+    # RSI (6)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0))
     loss = (-delta.where(delta < 0, 0))
@@ -27,65 +24,51 @@ def calculate_indicators_manual(df):
     rs = avg_gain / avg_loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # 3. KD (隨機指標 - 9,3,3)
-    # RSV = (今日收盤 - 最近9天最低) / (最近9天最高 - 最近9天最低) * 100
+    # KD (9,3,3)
     low_min = df['Low'].rolling(window=9).min()
     high_max = df['High'].rolling(window=9).max()
     df['RSV'] = (df['Close'] - low_min) / (high_max - low_min) * 100
-    # K = 2/3 * 昨日K + 1/3 * 今日RSV (使用 ewm 模擬遞迴運算, com=2 等同於 alpha=1/3)
     df['K'] = df['RSV'].ewm(com=2, adjust=False).mean()
     df['D'] = df['K'].ewm(com=2, adjust=False).mean()
 
-    # 4. 布林通道 (20, 2)
+    # 布林通道 (20, 2)
     std = df['Close'].rolling(window=20).std()
     df['BB_Upper'] = df['MA20'] + (std * 2)
     df['BB_Lower'] = df['MA20'] - (std * 2)
     
     return df
 
-# --- 1. 資料抓取 ---
+# --- 1. 資料抓取 (Fugle) ---
 def fetch_fugle_data(api_key, symbol, timeframe):
     try:
         client = RestClient(api_key=api_key)
         stock = client.stock
         
-        # 抓取盤中 K 棒
         candles = stock.intraday.candles(symbol=symbol)
         
         if 'data' not in candles or not candles['data']:
-            return None, "❌ 抓不到資料，請確認股票代號 (富果代號如 2330)"
+            return None, "❌ 抓不到資料 (請確認代號或是否開盤)"
 
-        # 轉成 DataFrame
         df = pd.DataFrame(candles['data'])
         df['date'] = pd.to_datetime(df['date'])
         df = df.set_index('date')
         
-        # 欄位重新命名
         df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
         df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
 
-        # 重取樣 (Resample)
-        ohlc_dict = {
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last',
-            'Volume': 'sum'
-        }
+        ohlc_dict = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
         df_resampled = df.resample(timeframe).apply(ohlc_dict).dropna()
 
         if len(df_resampled) < 20:
-            return None, "⚠️ 資料筆數不足 (<20筆)，無法計算均線，請稍晚再試"
+            return None, "⚠️ 資料筆數不足 (<20筆)，無法計算指標"
 
-        # --- 使用手寫函數計算指標 ---
         df_resampled = calculate_indicators_manual(df_resampled)
-
         return df_resampled, None
 
     except Exception as e:
-        return None, f"Fugle API 連線錯誤: {str(e)}"
+        return None, f"Fugle API 錯誤: {str(e)}"
 
-# --- 2. 本地快速訊號 ---
+# --- 2. 本地訊號掃描 ---
 def local_signal_scan(df):
     if df is None or len(df) < 1: return "等待數據...", "grey", []
     last = df.iloc[-1]
@@ -95,10 +78,10 @@ def local_signal_scan(df):
     # KD
     if pd.notna(last['K']) and pd.notna(last['D']):
         if last['K'] > last['D']:
-            signals.append(f"🔸 KD 金叉 (K:{last['K']:.1f} > D:{last['D']:.1f})")
+            signals.append(f"🔸 KD 金叉 ({last['K']:.1f} > {last['D']:.1f})")
             score += 1
         else:
-            signals.append(f"🔹 KD 死叉 (K:{last['K']:.1f} < D:{last['D']:.1f})")
+            signals.append(f"🔹 KD 死叉 ({last['K']:.1f} < {last['D']:.1f})")
             score -= 1
         if last['K'] < 20: signals.append("💎 KD 超賣 (<20)")
 
@@ -107,7 +90,7 @@ def local_signal_scan(df):
         if last['RSI'] < 25: signals.append("💎 RSI 超賣 (<25)")
         elif last['RSI'] > 75: signals.append("🔥 RSI 過熱 (>75)")
 
-    # MA & 布林
+    # MA
     if pd.notna(last['MA20']):
         if last['Close'] > last['MA20']:
             signals.append("✅ 站上月線")
@@ -115,10 +98,6 @@ def local_signal_scan(df):
         else:
             signals.append("🔻 跌破月線")
             score -= 1
-    
-    if pd.notna(last['BB_Upper']) and last['Close'] > last['BB_Upper']:
-        signals.append("🚀 衝破布林上軌")
-        score += 1
 
     if score >= 2: return "🚀 強力多頭訊號", "success", signals
     elif score >= 1: return "📈 偏多震盪", "info", signals
@@ -126,58 +105,82 @@ def local_signal_scan(df):
     elif score <= -1: return "📉 偏空震盪", "warning", signals
     else: return "⚖️ 盤整 / 訊號不明", "secondary", signals
 
-# --- 3. Gemini AI 分析 ---
+# --- 3. Gemini 3.0 智能引擎 (核心升級) ---
 def ask_gemini(stock_symbol, df):
     if "GEMINI_API_KEY" not in st.secrets:
-        return "❌ 錯誤：找不到 Gemini Key"
+        return "❌ 錯誤：找不到 GEMINI_API_KEY", "Unknown"
     
     api_key = st.secrets["GEMINI_API_KEY"]
+    genai.configure(api_key=api_key)
     
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        # 取最後 5 筆
-        recent = df.tail(5)[['Open', 'Close', 'Volume', 'MA5', 'MA20', 'RSI', 'K', 'D', 'BB_Upper', 'BB_Lower']]
-        recent.index = recent.index.strftime('%H:%M')
-        json_data = recent.to_json(orient="index")
+    # 🔥 2026年最新模型優先順序
+    model_candidates = [
+        "gemini-3-flash-preview",  # 2026 主力：博士級推論 + 極速
+        "gemini-2.5-flash",        # 2025 穩定版備援
+        "gemini-2.0-flash"         # 最後防線
+    ]
+    
+    used_model_name = ""
+    response_text = ""
 
-        prompt = f"""
-        你是一位專業的台股當沖教練。
-        股票代號：{stock_symbol}。
-        數據 (最後5根K棒)：{json_data}
-        
-        請給出「快狠準」的診斷：
-        1. **多空判斷**：目前趨勢？
-        2. **操作建議**：現在該買、賣還是觀望？(給出價位)
-        3. **風險提示**：注意什麼？
-        """
-        
-        with st.spinner("🤖 AI 教練正在分析..."):
+    # 自動尋找可用模型 (Auto-Fallback)
+    for model_name in model_candidates:
+        try:
+            model = genai.GenerativeModel(model_name)
+            
+            recent = df.tail(5)[['Open', 'Close', 'Volume', 'MA5', 'MA20', 'RSI', 'K', 'D', 'BB_Upper', 'BB_Lower']]
+            recent.index = recent.index.strftime('%H:%M')
+            json_data = recent.to_json(orient="index")
+
+            prompt = f"""
+            你是一位使用 Gemini 3 技術的頂尖台股教練。
+            
+            【戰情資料】
+            標的：{stock_symbol}
+            數據 (最新5根K棒)：{json_data}
+            
+            【分析指令】
+            請利用你強大的邏輯推論能力，給出一個「快、狠、準」的交易決策：
+            1. **多空定調**：一句話講完 (例如：多頭回檔守月線)。
+            2. **關鍵攻防**：明確指出下檔支撐與上檔壓力價位。
+            3. **操作建議**：
+               - 如果空手：哪裡買？
+               - 如果持有：續抱還是跑？
+            4. **風險雷達**：有無背離或主力騙線跡象？
+
+            (請用繁體中文，不需要客套，像戰場指揮官一樣直接下令)
+            """
+            
             response = model.generate_content(prompt)
-        return response.text
+            response_text = response.text
+            used_model_name = model_name
+            break # 成功就跳出
+            
+        except Exception:
+            continue # 失敗就試下一個
+    
+    if not response_text:
+        return "❌ 系統忙碌中，Gemini 所有模型暫時無法連線。", "None"
         
-    except Exception as e:
-        return f"Gemini 連線錯誤: {str(e)}"
+    return response_text, used_model_name
 
 # --- 主程式 ---
 def main():
-    st.title("🦅 AI 股市戰情室 (Fugle 直連版)")
+    st.title("⚡ AI 股市戰情室 (Gemini 3 Flash)")
+    st.caption("🚀 Powered by Google Gemini 3.0 Technology")
     
-    # 檢查 Keys
     if "FUGLE_API_KEY" in st.secrets and "GEMINI_API_KEY" in st.secrets:
         st.sidebar.success("✅ 雙鑰匙已載入")
     else:
         st.sidebar.error("❌ 缺少 API Key，請檢查 secrets.toml")
         return
 
-    # 側邊欄
     with st.sidebar:
         st.header("⚙️ 參數設定")
         symbol = st.text_input("股票代號", value="6274").upper()
         timeframe = st.selectbox("K線週期", ["1T", "5T", "15T", "30T", "60T"], index=1)
         
-        if st.button("🚀 啟動掃描", type="primary"):
+        if st.button("🚀 啟動 AI 掃描", type="primary"):
             st.session_state['run_scan'] = True
 
     if st.session_state.get('run_scan'):
@@ -190,7 +193,7 @@ def main():
             
             with col_chart:
                 last_bar = df.iloc[-1]
-                st.subheader(f"📊 {symbol} ({timeframe}) 走勢")
+                st.subheader(f"📊 {symbol} ({timeframe}) K線圖")
                 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("收盤價", f"{last_bar['Close']}")
@@ -210,7 +213,7 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
 
             with col_ai:
-                st.subheader("🤖 戰情判讀")
+                st.subheader("🤖 AI 戰情判讀")
                 summary, color, signals = local_signal_scan(df)
                 if color == "success": st.success(summary)
                 elif color == "error": st.error(summary)
@@ -222,9 +225,17 @@ def main():
 
                 st.divider()
 
-                if st.button("🧠 呼叫 AI 教練", type="primary"):
-                    analysis = ask_gemini(symbol, df)
-                    st.markdown(analysis)
+                if st.button("🧠 呼叫 Gemini 3.0", type="primary"):
+                    with st.spinner("⚡ Gemini 3 Flash 正在高速推理中..."):
+                        analysis, model_used = ask_gemini(symbol, df)
+                        
+                        # 顯示目前使用的引擎版本
+                        if "gemini-3" in model_used:
+                            st.caption(f"🚀 引擎：**{model_used}** (最新 V12 引擎)")
+                        else:
+                            st.caption(f"🛡️ 引擎：**{model_used}** (備援系統啟動)")
+                            
+                        st.markdown(analysis)
 
 if __name__ == "__main__":
     main()
