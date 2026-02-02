@@ -1,176 +1,232 @@
 import streamlit as st
-from fugle_marketdata import RestClient
+import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
+import plotly.graph_objects as go
+import google.generativeai as genai
 import json
-from datetime import datetime
 
-# --- 設定頁面 ---
-st.set_page_config(page_title="AI 股市指揮所 (Ultimate)", page_icon="🦅", layout="wide")
-st.title("🦅 股市全域戰情 (Ultimate Ver.)")
+# --- 頁面設定 ---
+st.set_page_config(page_title="AI 交易戰情室", layout="wide", page_icon="📈")
 
-# --- 側邊欄 ---
-with st.sidebar:
-    st.header("⚙️ 參數設定")
+# --- 1. 技術指標計算核心 (不依賴外部 TA 套件，減少錯誤) ---
+def calculate_indicators(df):
+    if df is None or len(df) < 20:
+        return df
     
-    # --- 智慧鑰匙判斷邏輯 (修改這段) ---
-    if 'fugle_api_key' in st.secrets:
-        # 如果雲端後台有設定，直接讀取，不顯示輸入框
-        api_key = st.secrets['fugle_api_key']
-        st.success("✅ API Key 已從雲端載入") 
+    # MA (移動平均)
+    df['MA5'] = df['Close'].rolling(window=5).mean()
+    df['MA20'] = df['Close'].rolling(window=20).mean() # 月線/布林中軌
+
+    # RSI (相對強弱指標)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=6).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=6).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # MACD
+    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp12 - exp26
+    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['Hist'] = df['MACD'] - df['Signal']
+
+    # KD (隨機指標) - 使用 9,3,3
+    low_min = df['Low'].rolling(window=9).min()
+    high_max = df['High'].rolling(window=9).max()
+    df['RSV'] = (df['Close'] - low_min) / (high_max - low_min) * 100
+    df['K'] = df['RSV'].ewm(com=2).mean() # 1/3權重約等於 com=2
+    df['D'] = df['K'].ewm(com=2).mean()
+
+    # Bollinger Bands (布林通道)
+    std = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['MA20'] + (std * 2)
+    df['BB_Lower'] = df['MA20'] - (std * 2)
+
+    return df
+
+# --- 2. 第一層：Python 規則基礎掃描 (快速) ---
+def analyze_technical_signals_rule_based(df):
+    if df is None or len(df) < 1:
+        return "資料不足", [], "grey"
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    signals = []
+    score = 0  
+
+    # MA 判斷
+    if last['Close'] > last['MA20']:
+        signals.append("✅ 股價站上月線 (短多)")
+        score += 1
     else:
-        # 如果後台沒設定 (例如在本機跑且沒 secrets.toml)，才顯示輸入框
-        api_key = st.text_input("Fugle API Key", type="password")
-    # ----------------------------------
+        signals.append("🔻 股價跌破月線 (短空)")
+        score -= 1
 
-    symbol = st.text_input("股票代號", value="3231")
-    timeframe = "5T"
+    # KD 判斷
+    if last['K'] > last['D']:
+        signals.append("🔸 KD 黃金交叉 (轉強)")
+        score += 1
+    elif last['K'] < last['D']:
+        signals.append("🔹 KD 死亡交叉 (轉弱)")
+        score -= 1
     
-    st.markdown("### 📊 指標參數")
-    ma_short = st.number_input("短均線 (MA)", value=5)
-    # 這裡如果不夠長，計算會回傳 null，但不影響程式運行
-    ma_long = st.number_input("長均線 (MA)", value=20) 
+    # RSI 判斷
+    if last['RSI'] > 75:
+        signals.append("🔥 RSI 過熱 (>75)")
+        score += 0.5
+    elif last['RSI'] < 25:
+        signals.append("💎 RSI 超賣 (<25)") # 視為機會
+        score += 0.5
 
-def get_signal(row):
-    # 簡單的訊號判讀，顯示在畫面上給人看
-    signal = []
-    if row['RSI'] < 20: signal.append("🟢RSI超賣")
-    if row['RSI'] > 80: signal.append("🔴RSI過熱")
-    if row['k'] < 20 and row['k'] > row['d']: signal.append("⚡KD金叉(低檔)")
-    return " ".join(signal) if signal else "觀察中"
+    # 布林判斷
+    if last['Close'] > last['BB_Upper']:
+        signals.append("🚀 衝破布林上軌")
+        score += 1
+    elif last['Close'] < last['BB_Lower']:
+        signals.append("💧 跌破布林下軌")
+        score -= 1
+
+    # 總結
+    if score >= 2: return "🚀 強力多頭訊號", signals, "success"
+    elif score >= 1: return "📈 偏多震盪", signals, "info"
+    elif score <= -2: return "🐻 強力空頭訊號", signals, "error"
+    elif score <= -1: return "📉 偏空震盪", signals, "warning"
+    else: return "⚖️ 多空膠著 / 盤整", signals, "secondary"
+
+# --- 3. 第二層：Gemini AI 深度分析 (大腦) ---
+def ask_gemini_analysis(df):
+    """將最近 5 根 K 棒數據整理成 JSON 餵給 Gemini"""
     
-# --- 新增這個函數用來抓中文名稱 ---
-@st.cache_data(ttl=86400)  # 🌟 重點：快取存 24 小時，超級省錢！
-def get_stock_name(symbol, api_key):
+    # 檢查 Secrets 是否存在
+    if "GEMINI_API_KEY" not in st.secrets:
+        return "❌ 錯誤：找不到 API Key，請檢查 secrets.toml 設定。"
+    
+    api_key = st.secrets["GEMINI_API_KEY"]
+    
     try:
-        client = RestClient(api_key=api_key)
-        # 呼叫 quote API 取得簡介，只為了拿 name
-        quote = client.stock.intraday.quote(symbol=symbol)
-        return quote.get('name', symbol)  # 如果抓不到就回傳代號
-    except Exception:
-        return symbol
+        # 1. 整理數據 (只取最後 5 筆，減少 Token 消耗並聚焦當下)
+        recent_data = df.tail(5).copy()
+        # 格式化時間索引
+        recent_data.index = recent_data.index.strftime('%Y-%m-%d %H:%M')
+        # 轉成 JSON 字串
+        data_json = recent_data[['Open', 'High', 'Low', 'Close', 'Volume', 'MA20', 'RSI', 'K', 'D', 'BB_Upper', 'BB_Lower']].to_json(orient="index")
+
+        # 2. 設定 Gemini
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+
+        # 3. 戰術指令 (Prompt)
+        prompt = f"""
+        你是一位身經百戰的台股當沖與波段交易教練。
+        請根據以下最新的即時技術指標數據 (JSON 格式)，進行專業判讀。
+
+        數據內容 (最後 5 根 K 棒)：
+        {data_json}
+
+        請給我一份簡短有力的「戰情診斷書」，包含以下部分：
+        1. **【多空判斷】**：一句話定調 (例如：多頭回檔、空方破線、盤整待變)。
+        2. **【關鍵價位】**：根據數據，指出下方的防守支撐價，與上方的壓力目標價。
+        3. **【操作建議】**：針對持有者，現在該續抱、加碼還是停損？(請果斷一點)。
+        4. **【風險警示】**：是否有背離、乖離過大或主力騙線的跡象？
+
+        要求：使用繁體中文，語氣專業、冷靜、客觀。不要講模稜兩可的廢話。
+        """
+
+        # 4. 發送請求
+        with st.spinner("🤖 AI 教練正在讀取盤勢..."):
+            response = model.generate_content(prompt)
         
-def process_data(symbol, api_key, timeframe):
-    client = RestClient(api_key=api_key)
-    stock = client.stock
-    
-    # 抓取 Intraday Candles
-    candles = stock.intraday.candles(symbol=symbol)
-    if 'data' not in candles or not candles['data']:
-        return None, "抓不到資料，請確認開盤中或 Key 正確"
+        return response.text
 
-    df = pd.DataFrame(candles['data'])
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.set_index('date')
-    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+    except Exception as e:
+        return f"Gemini 連線失敗: {str(e)}"
 
-    # 重取樣 (Resample)
-    ohlc_dict = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
-    df_res = df.resample(timeframe).apply(ohlc_dict).dropna()
+# --- 主程式 ---
+def main():
+    st.title("📈 AI 智能股票戰情室")
 
-    # --- 1. 計算均線 ---
-    df_res[f'MA{ma_short}'] = ta.sma(df_res['Close'], length=ma_short)
-    df_res[f'MA{ma_long}'] = ta.sma(df_res['Close'], length=ma_long)
-
-    # --- 2. 計算 RSI ---
-    df_res['RSI'] = ta.rsi(df_res['Close'], length=6)
-
-    # --- 3. 計算 MACD ---
-    macd = ta.macd(df_res['Close'], fast=12, slow=26, signal=9)
-    if macd is not None:
-        df_res = pd.concat([df_res, macd], axis=1)
-
-    # --- 4. 計算 KD (Stochastic) --- 🌟 新增
-    # k=9, d=3, smooth_d=3
-    stoch = ta.stoch(df_res['High'], df_res['Low'], df_res['Close'], k=9, d=3, smooth_k=3)
-    if stoch is not None:
-        df_res = pd.concat([df_res, stoch], axis=1)
-        # pandas_ta 欄位名稱通常是 STOCHk_9_3_3, STOCHd_9_3_3，我們簡化它
-        df_res['k'] = df_res['STOCHk_9_3_3']
-        df_res['d'] = df_res['STOCHd_9_3_3']
-
-# --- 5. 計算布林通道 (Bollinger Bands) --- 🌟 修正版
-    bbands = ta.bbands(df_res['Close'], length=20, std=2)
-    if bbands is not None:
-        df_res = pd.concat([df_res, bbands], axis=1)
+    # 側邊欄輸入
+    with st.sidebar:
+        st.header("參數設定")
+        ticker_input = st.text_input("股票代號 (台股請加 .TW)", value="6274.TW").upper()
+        interval = st.selectbox("K線週期", ["1m", "5m", "15m", "60m", "1d"], index=1)
+        period = "5d" # 預設抓 5 天資料
         
-        # 🌟 修正重點：自動抓取欄位名稱 (不用猜是 2.0 還是 2)
-        # 直接從產生的欄位裡，找出 BBU (上軌) 和 BBL (下軌) 開頭的
-        for col in bbands.columns:
-            if col.startswith("BBU"):  # 抓上軌
-                df_res['BB_Upper'] = df_res[col]
-            elif col.startswith("BBL"): # 抓下軌
-                df_res['BB_Lower'] = df_res[col]
+        st.info("💡 範例：\n台積電: 2330.TW\n台燿: 6274.TW\n創意: 3443.TW")
 
-    return df_res, None
-
-if st.button("🚀 啟動全域掃描"):
-    if not api_key:
-        st.error("請輸入 API Key")
-    else:
+    if ticker_input:
+        # 1. 抓取資料
         try:
-            # 1. 先抓名字 (這會用快取，不扣次數)
-            stock_name = get_stock_name(symbol, api_key)
+            df = yf.download(ticker_input, period=period, interval=interval, progress=False)
             
-            # 2. 再顯示大標題
-            st.subheader(f"📊 {stock_name} ({symbol}) - {timeframe}")
+            if df.empty:
+                st.error("❌ 找不到資料，請檢查代號是否正確 (台股記得加 .TW)")
+                return
 
-            # 3. 接著才是原本的運算 (這會用 60秒快取)
-            df, error = process_data(symbol, api_key, timeframe)
-            if error:
-                st.error(error)
-            else:
-                # 取得最新一筆資料
-                latest = df.iloc[-1]
-                
-                # 畫面顯示即時重點
-                col1, col2, col3 = st.columns(3)
-                col1.metric("現價", f"{latest['Close']}", f"{latest['Volume']:.0f} 張")
-                col2.metric("RSI (6)", f"{latest['RSI']:.2f}")
-                
-                # 處理 KD 顯示 (如果資料不足會是 NaN)
-                k_val = f"{latest.get('k', 0):.2f}" if pd.notna(latest.get('k')) else "N/A"
-                col3.metric("KD (K值)", k_val)
+            # 2. 計算指標
+            df = calculate_indicators(df)
 
-                st.info(f"AI 訊號掃描: {get_signal(latest)}")
+            # 3. 畫面佈局
+            col_chart, col_analysis = st.columns([2, 1])
 
-                # 準備 JSON
-                output_df = df.tail(5).copy()
-                output_df.index = output_df.index.strftime('%H:%M')
+            with col_chart:
+                st.subheader(f"{ticker_input} - 走勢圖")
                 
-                # 清理 NaN (JSON 不支援 NaN)
-                output_df = output_df.fillna("資料不足")
+                # 繪製 K 線圖
+                fig = go.Figure(data=[go.Candlestick(x=df.index,
+                                open=df['Open'],
+                                high=df['High'],
+                                low=df['Low'],
+                                close=df['Close'],
+                                name='K線')])
                 
-                technical_data = output_df.to_dict(orient='index')
+                # 加上布林通道與 MA
+                fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange', width=1), name='月線(MA20)'))
+                fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], line=dict(color='gray', width=1, dash='dot'), name='布林上軌'))
+                fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], line=dict(color='gray', width=1, dash='dot'), name='布林下軌'))
 
-                payload = {
-                    "stock": f"{stock_name} ({symbol})",
-                    "timeframe": timeframe,
-                    "indicators": {
-                        "MA": f"MA{ma_short} vs MA{ma_long}",
-                        "RSI": "RSI(6)",
-                        "MACD": "12,26,9",
-                        "KD": "9,3,3 (Slow)",
-                        "Bollinger": "20, 2"
-                    },
-                    "data": technical_data
-                }
+                fig.update_layout(height=500, xaxis_rangeslider_visible=False, template="plotly_dark")
+                st.plotly_chart(fig, use_container_width=True)
                 
-                json_str = json.dumps(payload, indent=2, ensure_ascii=False)
+                # 顯示最新報價數據
+                last_bar = df.iloc[-1]
+                cols = st.columns(4)
+                cols[0].metric("收盤價", f"{last_bar['Close']:.2f}")
+                cols[1].metric("RSI", f"{last_bar['RSI']:.2f}")
+                cols[2].metric("KD (K)", f"{last_bar['K']:.2f}")
+                cols[3].metric("月線", f"{last_bar['MA20']:.2f}")
+
+            with col_analysis:
+                st.subheader("🤖 AI 戰情判讀")
                 
-                st.subheader("📋 複製這串給 Gemini")
-                st.code(json_str, language='json')
+                # --- 第一層：Python 快速掃描 ---
+                summary, signals, color = analyze_technical_signals_rule_based(df)
                 
-                # 簡單畫圖：K值與 D值
-                if 'k' in df.columns:
-                    st.line_chart(df[['k', 'd']].tail(50))
-                
+                st.markdown("### ⚡ 快速訊號掃描")
+                if color == "success": st.success(summary)
+                elif color == "error": st.error(summary)
+                elif color == "warning": st.warning(summary)
+                else: st.info(summary)
+
+                with st.expander("查看訊號細節", expanded=True):
+                    for s in signals:
+                        st.write(s)
+
+                st.divider()
+
+                # --- 第二層：Gemini 深度分析 ---
+                st.markdown("### 🧠 深度戰略分析")
+                if st.button("呼叫 AI 教練診斷", type="primary", use_container_width=True):
+                    analysis_result = ask_gemini_analysis(df)
+                    st.markdown(analysis_result)
+                    
+                    with st.expander("查看傳送給 AI 的原始數據"):
+                        st.dataframe(df.tail(5)[['Close', 'RSI', 'K', 'D', 'MA20']])
+
         except Exception as e:
             st.error(f"發生錯誤: {e}")
 
-
-
-
-
-
+if __name__ == "__main__":
+    main()
