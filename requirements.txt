@@ -1,4 +1,6 @@
 streamlit
-fugle-marketdata
-pandas_ta
+yfinance
 pandas
+numpy
+plotly
+google-generativeai
